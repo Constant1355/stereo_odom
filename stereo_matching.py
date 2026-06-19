@@ -24,8 +24,8 @@ from validate_model import SuperPoint, LightGlue
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibration')
 MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MAX_KEYPOINTS = 300       # max features per image
-CONFIDENCE_THRESH = 0.002  # keypoint confidence threshold
+MAX_KEYPOINTS = 120       # max features per image
+CONFIDENCE_THRESH = 0.005  # keypoint confidence threshold
 MATCH_THRESHOLD = 0.001    # minimum match confidence
 NMS_RADIUS = 4            # non-max suppression radius
 CAM_WIDTH = 1280
@@ -48,7 +48,8 @@ def load_models(device='cuda'):
         raise FileNotFoundError(f"Missing {sp_path}")
     sp_sd = torch.load(sp_path, map_location=device)
     sp.load_state_dict(sp_sd, strict=True)
-    print(f"  SuperPoint: loaded ({len(sp_sd)} tensors)")
+    sp = torch.compile(sp, mode='reduce-overhead')
+    print(f"  SuperPoint: loaded ({len(sp_sd)} tensors) + compiled")
     
     # LightGlue
     lg = LightGlue(dim=256, num_layers=9, num_heads=4).to(device).eval()
@@ -203,9 +204,8 @@ def superpoint_inference_batch(model, left_tensor, right_tensor, device):
     """
     batch = torch.cat([left_tensor, right_tensor], dim=0)  # (2,1,H,W)
     
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=True):
-            semi_batch, desc_batch = model(batch)  # (2,65,Hc,Wc), (2,256,Hc,Wc)
+    with torch.inference_mode():
+        semi_batch, desc_batch = model(batch)
     
     def extract(semi, desc_dense):
         Hc, Wc = semi.shape[2:]
@@ -274,9 +274,8 @@ def lightglue_inference(model, desc0, kpts0, desc1, kpts1, device):
     kpts1_norm = kpts1_t / torch.tensor([320., 240.], device=device) * 2 - 1
     
     # Run LightGlue
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=True):
-            matches_idx, scores = model(desc0_t, kpts0_norm, desc1_t, kpts1_norm)
+    with torch.inference_mode():
+        matches_idx, scores = model(desc0_t, kpts0_norm, desc1_t, kpts1_norm)
     
     matches_idx = matches_idx[0].cpu().numpy()  # (N0,)
     scores = scores[0].cpu().numpy()             # (N0,)
@@ -357,6 +356,7 @@ def main():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"\n  Device: {device}")
+    torch.backends.cudnn.benchmark = True
     
     # Load models
     sp, lg = load_models(device)
@@ -408,10 +408,14 @@ def main():
             right_t = torch.from_numpy(right_gray).unsqueeze(0).unsqueeze(0).to(device)
             
             # SuperPoint inference (batch=2: left+right in one forward pass)
+            sp_t0 = time.time()
             kpts0, desc0, kpts1, desc1 = superpoint_inference_batch(sp, left_t, right_t, device)
+            sp_t = time.time() - sp_t0
             
             # LightGlue matching
+            lg_t0 = time.time()
             matches, match_conf = lightglue_inference(lg, desc0, kpts0, desc1, kpts1, device)
+            lg_t = time.time() - lg_t0
             
             # FPS
             t1 = time.time()
@@ -431,7 +435,8 @@ def main():
             if frame_count % 30 == 0:
                 avg_fps = frame_count / (time.time() - fps_timer)
                 print(f"  Frame {frame_count} | FPS: {avg_fps:.1f} | "
-                      f"Kpts: {len(kpts0)}/{len(kpts1)} | Matches: {len(matches)}")
+                      f"Kpts: {len(kpts0)}/{len(kpts1)} | Matches: {len(matches)} | "
+                      f"SP: {sp_t*1000:.0f}ms LG: {lg_t*1000:.0f}ms")
             
             # Handle keys
             key = cv2.waitKey(1) & 0xFF
