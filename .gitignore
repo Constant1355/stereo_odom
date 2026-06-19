@@ -1,0 +1,18 @@
+# virtual env
+stereo_odom/
+
+# large model files (tracked via LFS or separate)
+*.pth
+
+# large wheel files
+*.whl
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
