@@ -241,17 +241,21 @@ def main():
             calib['K2'], calib['D2'], calib['R2'], calib['P2'], size, cv2.CV_32FC1)
         print("  Done")
     
+    # Create window
+    cv2.namedWindow('Stereo Camera', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Stereo Camera', 1280, 480)
+    
     # Capture loop
-    print("\n[4] Capturing 100 frames for validation...")
-    print(f"  Running headless - samples saved to stereo_samples/")
-    print(f"  Press Ctrl+C in terminal to stop early\n")
+    print("\n[4] Live display (press 'q' to quit, 's' to save pair)")
+    print(f"  Samples saved to stereo_samples/ every 10 frames\n")
     
     os.makedirs('stereo_samples', exist_ok=True)
     frame_count = 0
     saved_count = 0
-    save_interval = 10  # save every 10th frame
-    max_frames = 100
-    t_start = time.time()
+    save_interval = 10
+    max_frames = 1000
+    fps_timer = time.time()
+    fps = 0.0
     
     try:
         while frame_count < max_frames:
@@ -270,27 +274,62 @@ def main():
             else:
                 rect_left, rect_right = left, right
             
-            # Save sample frames
+            # Draw epipolar lines on rectified images
+            display_left = rect_left.copy()
+            display_right = rect_right.copy()
+            h, w = display_left.shape[:2]
+            for y in range(0, h, 30):
+                color = (0, 255, 0) if y % 60 == 0 else (60, 60, 60)
+                cv2.line(display_left, (0, y), (w, y), color, 1)
+                cv2.line(display_right, (0, y), (w, y), color, 1)
+            
+            # FPS (smoothed)
+            if frame_count % 5 == 0:
+                fps = frame_count / (time.time() - fps_timer)
+            fps = frame_count / (time.time() - fps_timer)
+            
+            # Overlay info
+            info = [
+                f"Stereo Camera Test",
+                f"FPS: {fps:.1f}  Frame: {frame_count}",
+                f"640x480 x 2 | Baseline: {float(calib['T'].flatten()[0]):.1f}mm" if calib else "No calibration",
+                f"[q] quit  [s] save",
+            ]
+            for i, txt in enumerate(info):
+                cv2.putText(display_left, txt, (10, 25 + i * 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            
+            # Combine for display
+            display = np.hstack([display_left, display_right])
+            cv2.imshow('Stereo Camera', display)
+            
+            # Save sample frames periodically
             if frame_count % save_interval == 0:
                 saved_count += 1
                 ts = time.strftime('%Y%m%d_%H%M%S')
                 cv2.imwrite(f'stereo_samples/{ts}_frame{frame_count:04d}_raw.png', frame)
                 cv2.imwrite(f'stereo_samples/{ts}_frame{frame_count:04d}_left.png', rect_left)
                 cv2.imwrite(f'stereo_samples/{ts}_frame{frame_count:04d}_right.png', rect_right)
+                print(f"  Saved #{saved_count} (frame {frame_count}) @ {fps:.1f} FPS", end='\r')
             
-            # Progress
-            fps = frame_count / (time.time() - t_start)
-            if frame_count % 10 == 0:
-                print(f"  Frame {frame_count}/{max_frames} | FPS: {fps:.1f}", end='\r')
-    
-    except KeyboardInterrupt:
-        print("\n  Interrupted")
+            # Handle keys
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n  User quit")
+                break
+            elif key == ord('s'):
+                saved_count += 1
+                ts = time.strftime('%Y%m%d_%H%M%S')
+                cv2.imwrite(f'stereo_samples/{ts}_frame{frame_count:04d}_left.png', rect_left)
+                cv2.imwrite(f'stereo_samples/{ts}_frame{frame_count:04d}_right.png', rect_right)
+                print(f"  Manual save #{saved_count} (frame {frame_count})")
     
     finally:
         cap.release()
+        cv2.destroyAllWindows()
     
     # Summary
-    duration = time.time() - t_start
+    duration = time.time() - fps_timer
     print("\n" + "=" * 60)
     print("  Summary")
     print("=" * 60)
