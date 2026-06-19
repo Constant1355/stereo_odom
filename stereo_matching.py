@@ -196,72 +196,56 @@ def open_camera(device=0):
 # SuperPoint Inference
 # =========================================================================
 
-def superpoint_inference(model, gray_tensor, device):
+def superpoint_inference_batch(model, left_tensor, right_tensor, device):
     """
-    Run SuperPoint and extract keypoints + descriptors.
-    
-    Args:
-        model: SuperPoint model
-        gray_tensor: (1, 1, H, W) normalized to [0,1], on device
-    Returns:
-        kpts: (N, 2) keypoint coordinates (x, y)
-        desc: (N, 256) descriptors
-        scores: (N,) confidence scores
+    Run SuperPoint on left+right images as batch=2.
+    One forward pass instead of two — halves CNN overhead.
     """
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=True):
-            semi, desc_dense = model(gray_tensor)  # (1,65,Hc,Wc), (1,256,Hc,Wc)
-    
-    Hc, Wc = semi.shape[2:]
-    
-    # Keypoint extraction
-    scores_soft = F.softmax(semi, dim=1)               # (1,65,Hc,Wc)
-    scores_grid = scores_soft[0, :-1, :, :]             # (64,Hc,Wc) - remove dustbin
-    max_scores, max_idx = scores_grid.max(dim=0)        # (Hc,Wc) each
-    
-    # NMS
-    nms_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (NMS_RADIUS, NMS_RADIUS))
-    nms_mask = (max_scores.cpu().numpy() >= CONFIDENCE_THRESH).astype(np.uint8)
-    nms_dilated = cv2.dilate(nms_mask, nms_kernel)
-    
-    # Keypoint candidates
-    ys, xs = np.where((nms_mask == 1) & (nms_dilated == nms_mask))
-    
-    # Limit keypoints by confidence
-    confs = max_scores[ys, xs].cpu().numpy()
-    order = np.argsort(-confs)[:MAX_KEYPOINTS]
-    ys, xs, confs = ys[order], xs[order], confs[order]
-    
-    if len(xs) == 0:
-        return np.zeros((0, 2)), np.zeros((0, 256)), np.zeros((0,))
-    
-    # Map to original resolution (each cell is 8x8 pixels)
-    cell_indices = max_idx[ys, xs].cpu().numpy()  # which of the 64 sub-cells
-    cx, cy = cell_indices % 8, cell_indices // 8
-    kpx = (xs * 8 + cx).astype(np.float32)
-    kpy = (ys * 8 + cy).astype(np.float32)
-    kpts = np.stack([kpx, kpy], axis=1)
-    
-    # Sample descriptors at keypoint locations (bilinear interpolation)
-    # desc_dense shape: (1, 256, Hc, Wc)
-    desc = desc_dense[0]  # (256, Hc, Wc)
-    # Grid sample coordinates [-1, 1]
-    grid_x = xs.astype(np.float32) / max(Wc - 1, 1) * 2 - 1
-    grid_y = ys.astype(np.float32) / max(Hc - 1, 1) * 2 - 1
-    grid = torch.from_numpy(np.stack([grid_x, grid_y], axis=1)).unsqueeze(0).unsqueeze(0)  # (1,1,N,2)
-    grid = grid.to(device)
+    batch = torch.cat([left_tensor, right_tensor], dim=0)  # (2,1,H,W)
     
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=True):
-            sampled = F.grid_sample(
-            desc.unsqueeze(0), grid, mode='bilinear', align_corners=True
-        )  # (1,256,1,N)
-    sampled_desc = sampled[0, :, 0, :].T.cpu().numpy()  # (N,256)
+            semi_batch, desc_batch = model(batch)  # (2,65,Hc,Wc), (2,256,Hc,Wc)
     
-    # Normalize descriptors
-    sampled_desc = sampled_desc / (np.linalg.norm(sampled_desc, axis=1, keepdims=True) + 1e-12)
+    def extract(semi, desc_dense):
+        Hc, Wc = semi.shape[2:]
+        scores_soft = F.softmax(semi, dim=1)
+        scores_grid = scores_soft[0, :-1]
+        max_scores, max_idx = scores_grid.max(dim=0)
+        
+        # NMS (GPU)
+        mask = max_scores >= CONFIDENCE_THRESH
+        pool = F.max_pool2d(max_scores.unsqueeze(0).unsqueeze(0),
+                             kernel_size=NMS_RADIUS, stride=1, padding=NMS_RADIUS//2)
+        pool = pool[:, :, :Hc, :Wc]
+        nms_mask = (max_scores == pool[0,0]) & mask
+        
+        indices = torch.nonzero(nms_mask)
+        if indices.shape[0] == 0:
+            return np.zeros((0,2)), np.zeros((0,256)), np.zeros((0,))
+        
+        ys, xs = indices[:, 0], indices[:, 1]
+        confs = max_scores[ys, xs]
+        order = torch.argsort(-confs)[:MAX_KEYPOINTS]
+        ys, xs = ys[order], xs[order]
+        
+        cell_ids = max_idx[ys, xs]
+        kpx = (xs.float() * 8 + (cell_ids % 8).float()).cpu().numpy()
+        kpy = (ys.float() * 8 + (cell_ids // 8).float()).cpu().numpy()
+        
+        # Grid sample descriptors
+        gx = xs.float() / max(Wc - 1, 1) * 2 - 1
+        gy = ys.float() / max(Hc - 1, 1) * 2 - 1
+        grid = torch.stack([gx, gy], dim=1).unsqueeze(0).unsqueeze(0)
+        sampled = F.grid_sample(desc_dense, grid, mode='bilinear', align_corners=True)
+        desc = F.normalize(sampled[0, :, 0, :].T, p=2, dim=1)
+        
+        kpts = np.stack([kpx, kpy], axis=1)
+        return kpts, desc.cpu().numpy(), confs.cpu().numpy()
     
-    return kpts, sampled_desc, confs
+    kpts0, d0, _ = extract(semi_batch[0:1], desc_batch[0:1])
+    kpts1, d1, _ = extract(semi_batch[1:2], desc_batch[1:2])
+    return kpts0, d0, kpts1, d1
 
 
 # =========================================================================
@@ -423,9 +407,8 @@ def main():
             left_t = torch.from_numpy(left_gray).unsqueeze(0).unsqueeze(0).to(device)
             right_t = torch.from_numpy(right_gray).unsqueeze(0).unsqueeze(0).to(device)
             
-            # SuperPoint inference
-            kpts0, desc0, _ = superpoint_inference(sp, left_t, device)
-            kpts1, desc1, _ = superpoint_inference(sp, right_t, device)
+            # SuperPoint inference (batch=2: left+right in one forward pass)
+            kpts0, desc0, kpts1, desc1 = superpoint_inference_batch(sp, left_t, right_t, device)
             
             # LightGlue matching
             matches, match_conf = lightglue_inference(lg, desc0, kpts0, desc1, kpts1, device)
