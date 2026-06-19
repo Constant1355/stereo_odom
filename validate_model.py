@@ -182,8 +182,8 @@ class LightGlue(nn.Module):
             s, _, _ = self.log_assignment[i](x0, x1)
             scores_list.append(s)
         scores = scores_list[-1]
-        mutual = F.softmax(scores, -1) * F.softmax(scores.transpose(1, 2), -1).transpose(1, 2)
-        match_scores, matches0 = mutual.max(dim=-1)
+        scores0 = F.softmax(scores, -1)
+        match_scores, matches0 = scores0.max(dim=-1)
         return matches0, match_scores
 
 
